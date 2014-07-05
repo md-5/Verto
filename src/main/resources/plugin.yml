@@ -1,0 +1,11 @@
+name: ${project.name}
+version: ${project.version}
+description: ${project.description}
+author: md_5
+website: ${project.url}
+
+main: net.md_5.map.MapFun
+
+commands:
+  map:
+    description: Map fun!
