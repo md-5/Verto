@@ -9,6 +9,15 @@ import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
 import lombok.Data;
 
+/**
+ * This is a small ELF parser designed specifically for MIPS32 ELF files. In
+ * order to prevent surprises in the development of Verto, there is an extremely
+ * large amount of validation to ensure that only pristine ELF files get past
+ * the loading stage.
+ *
+ * Anyone looking to contribute further to this file should attempt to factor
+ * out all of the magic ELF constants (man 5 elf) and validate them accordingly.
+ */
 @Data
 public class ELF
 {
@@ -16,8 +25,162 @@ public class ELF
     // Some MIPS32 ELF constants
     private static final int E_MIPS_ABI_O32 = 0x00001000;
     private static final int EF_MIPS_ARCH_32 = 0x50000000;
-
     //
+    private final int e_type;
+    private final int e_machine;
+    private final long e_version;
+    private final long e_entry;
+    private final long e_phoff;
+    private final long e_shoff;
+    private final long e_flags;
+    private final int e_ehsize;
+    private final int e_phentsize;
+    private final int e_phnum;
+    private final int e_shentsize;
+    private final int e_shnum;
+    private final int e_shstrndx;
+    //
+    private final ProgramHeader[] programHeaders;
+    private final SectionHeader[] sectionHeaders;
+
+    public ELF(ByteBuf buf)
+    {
+        if ( buf.readUnsignedByte() != 0x7F || buf.readUnsignedByte() != 'E' || buf.readUnsignedByte() != 'L' || buf.readUnsignedByte() != 'F' )
+        {
+            throw new IllegalArgumentException( "Not an ELF file (Invalid Magic)" );
+        }
+
+        // EI_CLASS: 1 for 32 bit, 2 for 64 bit
+        short clazz = buf.readUnsignedByte();
+        Preconditions.checkArgument( clazz == 1, "Can only handle 32 bit ELFs (expected 1 but got %s)", clazz );
+
+        // EL_DATA: 1 for little endian, 2 for big endian
+        short endian = buf.readUnsignedByte();
+        Preconditions.checkArgument( endian == 2, "Can only handle big endian ELFs (expected 2 but got %s)", endian );
+
+        // EL_VERSION: 1 for original ELF version
+        short version = buf.readUnsignedByte();
+        Preconditions.checkArgument( version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)" );
+
+        // EI_OSABI: Operating system ABI, check Wikipedia for individual values
+        short abi = buf.readUnsignedByte();
+        Preconditions.checkArgument( abi == 0, "Can only handle System V ELFs (expected 0 but got %s)", abi );
+
+        // EI_ABIVERSION
+        short abiVer = buf.readUnsignedByte();
+        Preconditions.checkArgument( abiVer == 0, "Can only handle version 0 ABI (expected 0 but got %s)", abiVer );
+
+        // EI_PAD: 7 bytes padding
+        buf.skipBytes( 7 );
+
+        /**
+         * The actual ELF parsing starts here, the above is just the header
+         */
+        // e_type: 1, 2, 3, 4: relocatable, executable, shared, core
+        e_type = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_type == 2, "Can only handle executable ELFs (expected 2 but got %s)", e_type );
+
+        // e_machine: See Wikipedia for individual values
+        e_machine = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_machine == 8, "Can only handle MIPS ELFs (expected 8 but got %s)", e_machine );
+
+        // e_version: Another version field, bigger this time
+        e_version = buf.readUnsignedInt();
+        Preconditions.checkArgument( e_version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)", e_version );
+
+        // e_entry: Program entry point (long in 64 bit)
+        e_entry = buf.readUnsignedInt();
+
+        // e_phoff: Program header offset
+        e_phoff = buf.readUnsignedInt();
+
+        // e_shoff: Section header offset
+        e_shoff = buf.readUnsignedInt();
+
+        // e_flags: Flags specific to the target arch
+        e_flags = buf.readUnsignedInt();
+        Preconditions.checkArgument( ( e_flags & E_MIPS_ABI_O32 ) != 0, "Can only read O32 MIPS ELFs" );
+        Preconditions.checkArgument( ( e_flags & EF_MIPS_ARCH_32 ) != 0, "Can only read MIPS32 ELFs" );
+
+        // e_ehsize: Header size, should be 52 for 32 bit ELFs
+        e_ehsize = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_ehsize == 52, "Strange ELF header size (expected 52 but got %s)", e_ehsize );
+
+        // e_phentsize: Size of a program header entry, should be 32 for 32 bit ELFs
+        e_phentsize = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_phentsize == 32, "Strange program header size (expected 32 but got %s)", e_phentsize );
+
+        // e_phnum: Number of program header entries
+        e_phnum = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_phnum != 0xFFFF, "Program headers not in expected place (phNum was 0xFFFF)" );
+
+        // e_shentsize: Size of a section header entry, should be 40 for 32 bit ELFs
+        e_shentsize = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_shentsize == 40, "Strange section header size (expected 40 but got %s)", e_shentsize );
+
+        // e_shnum: Number of section header entries
+        e_shnum = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_shnum != 0, "Section headers not in expected place (shNum was 0)" );
+
+        // e_shstrndx: Index of section header table entry that contains section names
+        e_shstrndx = buf.readUnsignedShort();
+        Preconditions.checkArgument( e_shstrndx != 0, "Program must have a section header name table (shNameOff was 0)" );
+        Preconditions.checkArgument( e_shstrndx != 0xFFFF, "Section name table not in expected place (shNameOff was 0xFFFF)" );
+
+        Preconditions.checkState( buf.readerIndex() == e_phoff, "Not at start of program header table (expected position %s but was %s)", e_phoff, buf.readerIndex() );
+
+        programHeaders = new ProgramHeader[ e_phnum ];
+        for ( int i = 0; i < programHeaders.length; i++ )
+        {
+            // Check we are starting from the right place
+            long expectedStart = e_phoff + ( i * e_phentsize );
+            Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
+
+            // Load section
+            programHeaders[i] = new ProgramHeader( buf );
+
+            // Check we are ending in the right place
+            long expectedEnd = expectedStart + e_phentsize;
+            Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
+        }
+
+        // Skip to start of section headers
+        buf.readerIndex( (int) e_shoff ); // FIXME: Int cast
+        sectionHeaders = new SectionHeader[ e_shnum ];
+        for ( int i = 0; i < sectionHeaders.length; i++ )
+        {
+            // Check we are starting from the right place
+            long expectedStart = e_shoff + ( i * e_shentsize );
+            Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
+
+            // Load section
+            sectionHeaders[i] = new SectionHeader( buf );
+
+            // Check we are ending in the right place
+            long expectedEnd = expectedStart + e_shentsize;
+            Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
+        }
+
+        SectionHeader stringTable = sectionHeaders[e_shstrndx];
+        for ( SectionHeader header : sectionHeaders )
+        {
+            StringBuilder name = new StringBuilder();
+
+            long offset = header.getSh_name();
+            while ( true )
+            {
+                byte b = stringTable.getData().getByte( (int) offset++ );
+                if ( b == 0 )
+                {
+                    break;
+                }
+                name.append( (char) b );
+            }
+
+            header.setName( name.toString() );
+        }
+    }
+
     @Data
     public static class ProgramHeader
     {
@@ -33,22 +196,21 @@ public class ELF
         private final long p_flags;
         private final long p_align;
         //
-        private final ByteBuf data;
+        private transient ByteBuf data;
 
-        protected static ProgramHeader load(ByteBuf buf)
+        protected ProgramHeader(ByteBuf buf)
         {
-            long p_type = buf.readUnsignedInt();
-            long p_offset = buf.readUnsignedInt();
-            long p_vaddr = buf.readUnsignedInt();
-            long p_paddr = buf.readUnsignedInt();
-            long p_filesz = buf.readUnsignedInt();
-            long p_memsz = buf.readUnsignedInt();
-            long p_flags = buf.readUnsignedInt();
-            long p_align = buf.readUnsignedInt();
+            p_type = buf.readUnsignedInt();
+            p_offset = buf.readUnsignedInt();
+            p_vaddr = buf.readUnsignedInt();
+            p_paddr = buf.readUnsignedInt();
+            p_filesz = buf.readUnsignedInt();
+            p_memsz = buf.readUnsignedInt();
+            p_flags = buf.readUnsignedInt();
+            p_align = buf.readUnsignedInt();
 
             Preconditions.checkArgument( p_memsz >= p_filesz, "MemSz cannot be smaller than filesz" );
 
-            ByteBuf data = null;
             // This indicates a load data section
             if ( p_type == PT_LOAD )
             {
@@ -57,8 +219,6 @@ public class ELF
                 data.writeBytes( buf, (int) p_offset, (int) p_filesz );
                 data.writerIndex( (int) ( data.writerIndex() + ( p_memsz - p_filesz ) ) );
             }
-
-            return new ProgramHeader( p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align, data );
         }
     }
 
@@ -79,7 +239,7 @@ public class ELF
         private final long sh_addralign;
         private final long sh_entsize;
         //
-        private ByteBuf data;
+        private transient ByteBuf data;
         private String name;
 
         public SectionHeader(ByteBuf buf)
@@ -112,145 +272,7 @@ public class ELF
     {
         try ( RandomAccessFile in = new RandomAccessFile( file, "r" ) )
         {
-            return load( Unpooled.wrappedBuffer( in.getChannel().map( FileChannel.MapMode.READ_ONLY, 0, in.length() ) ) );
+            return new ELF( Unpooled.wrappedBuffer( in.getChannel().map( FileChannel.MapMode.READ_ONLY, 0, in.length() ) ) );
         }
-    }
-
-    public static ELF load(ByteBuf buf)
-    {
-        if ( buf.readUnsignedByte() != 0x7F || buf.readUnsignedByte() != 'E' || buf.readUnsignedByte() != 'L' || buf.readUnsignedByte() != 'F' )
-        {
-            throw new IllegalArgumentException( "Not an ELF file (Invalid Magic)" );
-        }
-
-        // EI_CLASS: 1 for 32 bit, 2 for 64 bit
-        short clazz = buf.readUnsignedByte();
-        Preconditions.checkArgument( clazz == 1, "Can only handle 32 bit ELFs (expected 1 but got %s)", clazz );
-
-        // EL_DATA: 1 for little endian, 2 for big endian
-        short endian = buf.readUnsignedByte();
-        Preconditions.checkArgument( endian == 2, "Can only handle big endian ELFs (expected 2 but got %s)", endian );
-
-        // EL_VERSION: 1 for original ELF version
-        short version = buf.readUnsignedByte();
-        Preconditions.checkArgument( version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)" );
-
-        // EI_OSABI: Operating system ABI, check Wikipedia for individual values
-        short abi = buf.readUnsignedByte();
-        Preconditions.checkArgument( abi == 0, "Can only handle System V ELFs (expected 0 but got %s)", abi );
-
-        // EI_ABIVERSION
-        short abiVer = buf.readUnsignedByte();
-        Preconditions.checkArgument( abiVer == 0, "Can only handle version 0 ABI (expected 0 but got %s)", abiVer );
-
-        // EI_PAD: 7 bytes padding
-        buf.skipBytes( 7 );
-
-        // e_type: 1, 2, 3, 4: relocatable, executable, shared, core
-        int type = buf.readUnsignedShort();
-        Preconditions.checkArgument( type == 2, "Can only handle executable ELFs (expected 2 but got %s)", type );
-
-        // e_machine: See Wikipedia for individual values
-        int machine = buf.readUnsignedShort();
-        Preconditions.checkArgument( machine == 8, "Can only handle MIPS ELFs (expected 8 but got %s)", machine );
-
-        // e_version: Another version field, bigger this time
-        long longVersion = buf.readUnsignedInt();
-        Preconditions.checkArgument( longVersion == 1, "Can only handle version 1 ELFs (expected 1 but got %s)", longVersion );
-
-        // e_entry: Program entry point (long in 64 bit)
-        long entry = buf.readUnsignedInt();
-
-        // e_phoff: Program header offset
-        long phOff = buf.readUnsignedInt();
-
-        // e_shoff: Section header offset
-        long shOff = buf.readUnsignedInt();
-
-        // e_flags: Flags specific to the target arch
-        long flags = buf.readUnsignedInt();
-        Preconditions.checkArgument( ( flags & E_MIPS_ABI_O32 ) != 0, "Can only read O32 MIPS ELFs" );
-        Preconditions.checkArgument( ( flags & EF_MIPS_ARCH_32 ) != 0, "Can only read MIPS32 ELFs" );
-
-        // e_ehsize: Header size, should be 52 for 32 bit ELFs
-        int headerSize = buf.readUnsignedShort();
-        Preconditions.checkArgument( headerSize == 52, "Strange ELF header size (expected 52 but got %s)", headerSize );
-
-        // e_phentsize: Size of a program header entry, should be 32 for 32 bit ELFs
-        int phEntSize = buf.readUnsignedShort();
-        Preconditions.checkArgument( phEntSize == 32, "Strange program header size (expected 32 but got %s)", phEntSize );
-
-        // e_phnum: Number of program header entries
-        int phNum = buf.readUnsignedShort();
-        Preconditions.checkArgument( phNum != 0xFFFF, "Program headers not in expected place (phNum was 0xFFFF)" );
-
-        // e_shentsize: Size of a section header entry, should be 40 for 32 bit ELFs
-        int shEntSize = buf.readUnsignedShort();
-        Preconditions.checkArgument( shEntSize == 40, "Strange section header size (expected 40 but got %s)", shEntSize );
-
-        // e_shnum: Number of section header entries
-        int shNum = buf.readUnsignedShort();
-        Preconditions.checkArgument( shNum != 0, "Section headers not in expected place (shNum was 0)" );
-
-        // e_shstrndx: Index of section header table entry that contains section names
-        int shNameOff = buf.readUnsignedShort();
-        Preconditions.checkArgument( shNameOff != 0, "Program must have a section header name table (shNameOff was 0)" );
-        Preconditions.checkArgument( shNameOff != 0xFFFF, "Section name table not in expected place (shNameOff was 0xFFFF)" );
-
-        Preconditions.checkState( buf.readerIndex() == phOff, "Not at start of program header table (expected position %s but was %s)", phOff, buf.readerIndex() );
-
-        ProgramHeader[] programHeaders = new ProgramHeader[ phNum ];
-        for ( int i = 0; i < programHeaders.length; i++ )
-        {
-            // Check we are starting from the right place
-            long expectedStart = phOff + ( i * phEntSize );
-            Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
-
-            // Load section
-            programHeaders[i] = ProgramHeader.load( buf );
-
-            // Check we are ending in the right place
-            long expectedEnd = expectedStart + phEntSize;
-            Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
-        }
-
-        // Skip to start of section headers
-        buf.readerIndex( (int) shOff ); // FIXME: Int cast
-        SectionHeader[] sectionHeaders = new SectionHeader[ shNum ];
-        for ( int i = 0; i < sectionHeaders.length; i++ )
-        {
-            // Check we are starting from the right place
-            long expectedStart = shOff + ( i * shEntSize );
-            Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
-
-            // Load section
-            sectionHeaders[i] = new SectionHeader( buf );
-
-            // Check we are ending in the right place
-            long expectedEnd = expectedStart + shEntSize;
-            Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
-        }
-
-        SectionHeader stringTable = sectionHeaders[shNameOff];
-        for ( SectionHeader header : sectionHeaders )
-        {
-            StringBuilder name = new StringBuilder();
-
-            long offset = header.getSh_name();
-            while ( true )
-            {
-                byte b = stringTable.getData().getByte( (int) offset++ );
-                if ( b == 0 )
-                {
-                    break;
-                }
-                name.append( (char) b );
-            }
-
-            header.setName( name.toString() );
-            System.out.println( header );
-        }
-
-        return null;
     }
 }
