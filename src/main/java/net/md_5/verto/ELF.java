@@ -60,7 +60,7 @@ public class ELF
 
         // EL_VERSION: 1 for original ELF version
         short version = buf.readUnsignedByte();
-        Preconditions.checkArgument( version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)" );
+        Preconditions.checkArgument( version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)", version );
 
         // EI_OSABI: Operating system ABI, check Wikipedia for individual values
         short abi = buf.readUnsignedByte();
