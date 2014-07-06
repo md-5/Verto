@@ -7,15 +7,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
-import java.util.ArrayList;
-import java.util.List;
 import lombok.Data;
 
 @Data
 public class ELF
 {
 
-    // Sopme MIPS32 ELF constants
+    // Some MIPS32 ELF constants
     private static final int E_MIPS_ABI_O32 = 0x00001000;
     private static final int EF_MIPS_ARCH_32 = 0x50000000;
 
@@ -24,12 +22,9 @@ public class ELF
     public static class ProgramHeader
     {
 
-        public enum Type
-        {
-
-            NULL, LOAD, DYNAMIC, INTERP, NOTE, SHLIB, PHDR, TLS;
-        }
-        private final Type p_type;
+        private static final int PT_LOAD = 1;
+        //
+        private final long p_type;
         private final long p_offset;
         private final long p_vaddr;
         private final long p_paddr;
@@ -37,15 +32,12 @@ public class ELF
         private final long p_memsz;
         private final long p_flags;
         private final long p_align;
+        //
+        private final ByteBuf data;
 
         protected static ProgramHeader load(ByteBuf buf)
         {
             long p_type = buf.readUnsignedInt();
-            // Check that Type is within expected range
-            Preconditions.checkArgument( 0 <= p_type && p_type < Type.values().length );
-            // This is safe due to the check above
-            Type type = Type.values()[(int) p_type];
-
             long p_offset = buf.readUnsignedInt();
             long p_vaddr = buf.readUnsignedInt();
             long p_paddr = buf.readUnsignedInt();
@@ -54,7 +46,65 @@ public class ELF
             long p_flags = buf.readUnsignedInt();
             long p_align = buf.readUnsignedInt();
 
-            return new ProgramHeader( type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align );
+            Preconditions.checkArgument( p_memsz >= p_filesz, "MemSz cannot be smaller than filesz" );
+
+            ByteBuf data = null;
+            // This indicates a load data section
+            if ( p_type == PT_LOAD )
+            {
+                // FIXME: Netty only supports ints!
+                data = buf.alloc().directBuffer( (int) p_memsz );
+                data.writeBytes( buf, (int) p_offset, (int) p_filesz );
+                data.writerIndex( (int) ( data.writerIndex() + ( p_memsz - p_filesz ) ) );
+            }
+
+            return new ProgramHeader( p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align, data );
+        }
+    }
+
+    @Data
+    public static class SectionHeader
+    {
+
+        private static final int SHT_NULL = 0;
+        //
+        private final long sh_name;
+        private final long sh_type;
+        private final long sh_flags;
+        private final long sh_addr;
+        private final long sh_offset;
+        private final long sh_size;
+        private final long sh_link;
+        private final long sh_info;
+        private final long sh_addralign;
+        private final long sh_entsize;
+        //
+        private ByteBuf data;
+        private String name;
+
+        public SectionHeader(ByteBuf buf)
+        {
+            this.sh_name = buf.readUnsignedInt();
+            this.sh_type = buf.readUnsignedInt();
+            this.sh_flags = buf.readUnsignedInt();
+            this.sh_addr = buf.readUnsignedInt();
+            this.sh_offset = buf.readUnsignedInt();
+            this.sh_size = buf.readUnsignedInt();
+            this.sh_link = buf.readUnsignedInt();
+            this.sh_info = buf.readUnsignedInt();
+            this.sh_addralign = buf.readUnsignedInt();
+            this.sh_entsize = buf.readUnsignedInt();
+
+            if ( sh_type == SHT_NULL )
+            {
+                Preconditions.checkState( sh_addr == 0 && sh_offset == 0 && sh_size == 0, "Section header has type SHT_NULL but appears to have data" );
+            } else
+            {
+                // FIXME: Netty only supports ints!
+                // TODO: SH_NODATA should be initialized to 0?
+                data = buf.alloc().directBuffer( (int) sh_size );
+                data.writeBytes( buf, (int) sh_offset, (int) sh_size );
+            }
         }
     }
 
@@ -74,23 +124,23 @@ public class ELF
         }
 
         // EI_CLASS: 1 for 32 bit, 2 for 64 bit
-        int clazz = buf.readUnsignedByte();
+        short clazz = buf.readUnsignedByte();
         Preconditions.checkArgument( clazz == 1, "Can only handle 32 bit ELFs (expected 1 but got %s)", clazz );
 
         // EL_DATA: 1 for little endian, 2 for big endian
-        int endian = buf.readUnsignedByte();
+        short endian = buf.readUnsignedByte();
         Preconditions.checkArgument( endian == 2, "Can only handle big endian ELFs (expected 2 but got %s)", endian );
 
         // EL_VERSION: 1 for original ELF version
-        int version = buf.readUnsignedByte();
+        short version = buf.readUnsignedByte();
         Preconditions.checkArgument( version == 1, "Can only handle version 1 ELFs (expected 1 but got %s)" );
 
         // EI_OSABI: Operating system ABI, check Wikipedia for individual values
-        int abi = buf.readUnsignedByte();
+        short abi = buf.readUnsignedByte();
         Preconditions.checkArgument( abi == 0, "Can only handle System V ELFs (expected 0 but got %s)", abi );
 
         // EI_ABIVERSION
-        int abiVer = buf.readUnsignedByte();
+        short abiVer = buf.readUnsignedByte();
         Preconditions.checkArgument( abiVer == 0, "Can only handle version 0 ABI (expected 0 but got %s)", abiVer );
 
         // EI_PAD: 7 bytes padding
@@ -148,22 +198,58 @@ public class ELF
         Preconditions.checkArgument( shNameOff != 0xFFFF, "Section name table not in expected place (shNameOff was 0xFFFF)" );
 
         Preconditions.checkState( buf.readerIndex() == phOff, "Not at start of program header table (expected position %s but was %s)", phOff, buf.readerIndex() );
-        List<ProgramHeader> programHeaders = new ArrayList<>();
-        for ( int i = 0; i < phNum; i++ )
+
+        ProgramHeader[] programHeaders = new ProgramHeader[ phNum ];
+        for ( int i = 0; i < programHeaders.length; i++ )
         {
             // Check we are starting from the right place
             long expectedStart = phOff + ( i * phEntSize );
             Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
 
             // Load section
-            programHeaders.add( ProgramHeader.load( buf ) );
+            programHeaders[i] = ProgramHeader.load( buf );
 
             // Check we are ending in the right place
             long expectedEnd = expectedStart + phEntSize;
             Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
         }
 
-        Preconditions.checkState( buf.readerIndex() == shOff, "Not at start of section header table (expected position %s but was %s)", shOff, buf.readerIndex() );
+        // Skip to start of section headers
+        buf.readerIndex( (int) shOff ); // FIXME: Int cast
+        SectionHeader[] sectionHeaders = new SectionHeader[ shNum ];
+        for ( int i = 0; i < sectionHeaders.length; i++ )
+        {
+            // Check we are starting from the right place
+            long expectedStart = shOff + ( i * shEntSize );
+            Preconditions.checkState( buf.readerIndex() == expectedStart, "Not at correct start in program header table (expected position %s but was %s)", expectedStart );
+
+            // Load section
+            sectionHeaders[i] = new SectionHeader( buf );
+
+            // Check we are ending in the right place
+            long expectedEnd = expectedStart + shEntSize;
+            Preconditions.checkState( buf.readerIndex() == expectedEnd, "Not at correct end in program header table (expected position %s but was %s)", expectedEnd );
+        }
+
+        SectionHeader stringTable = sectionHeaders[shNameOff];
+        for ( SectionHeader header : sectionHeaders )
+        {
+            StringBuilder name = new StringBuilder();
+
+            long offset = header.getSh_name();
+            while ( true )
+            {
+                byte b = stringTable.getData().getByte( (int) offset++ );
+                if ( b == 0 )
+                {
+                    break;
+                }
+                name.append( (char) b );
+            }
+
+            header.setName( name.toString() );
+            System.out.println( header );
+        }
 
         return null;
     }
