@@ -1,4 +1,3 @@
-.data
 .global __start
 
 .text
